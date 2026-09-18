@@ -11,6 +11,18 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()]
   },
   renderer: {
+    build: {
+      rollupOptions: {
+        input: {
+          // The main Electron UI, and the standalone page served to remote
+          // LAN viewers by src/main/Socket.ts (see remote-carplay.md) - both
+          // get built into out/renderer/ so a single electron-vite build
+          // produces everything the app needs.
+          index: resolve('src/renderer/index.html'),
+          remote: resolve('src/renderer/remote.html')
+        }
+      }
+    },
     resolve: {
       alias: {
         '@renderer': resolve('src/renderer/src'),
