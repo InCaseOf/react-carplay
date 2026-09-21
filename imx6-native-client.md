@@ -1,13 +1,16 @@
-# Native i.MX6 client (design sketch - NOT YET BUILT)
+# Native i.MX6 client (design sketch)
 
-Status: **design only, ready to start building**. User has confirmed this
-is still the goal (bidirectional video/audio/touch, per remote-carplay.md's
-architecture, just with a hardware-decoding native client instead of a
-browser) and will **remove the Safelink ladder-logic program from the
-i.MX6** before implementation starts, so the new client has sole ownership
-of `imxv4l2sink`/the touchscreen/the sound card - no more coexistence
-concerns with whatever Safelink's video object was doing internally.
-Nothing in this document is implemented yet. See
+Status: **first draft written, not yet compiled or run on hardware.** See
+[imx6-client/](imx6-client/) for the actual C source (`main.c` - WebSocket
++ GStreamer pipelines - and `touch.c` - evdev reading) and its README for
+what's implemented vs. still-open (no toolchain was available to build or
+test it this session, and which `gst-launch` variant is the real
+production one on the board is still unconfirmed). User will **remove the
+Safelink ladder-logic program from the i.MX6** before this is tested, so
+the new client has sole ownership of `imxv4l2sink`/the touchscreen/the
+sound card - no more coexistence concerns with whatever Safelink's video
+object was doing internally. This document remains the design reference;
+see
 [remote-carplay.md](remote-carplay.md) for what *is* shipped (the
 browser-based remote viewer, which this is a second, alternative client
 for). Read that doc first - this one assumes its relay architecture.
@@ -77,28 +80,14 @@ single WebSocket frame with a **1-byte type tag** as its first byte:
 | 0x04 | touchEvent   | i.MX6 → SBC        | 1 byte `action` (14=Down, 15=Move, 16=Up - `TouchAction` from `node-carplay/web`) + 4 bytes `x` (f32 LE, 0..1) + 4 bytes `y` (f32 LE, 0..1) |
 
 All four map directly onto the existing relay events in
-[socketMessages.ts](src/shared/socketMessages.ts) - `Socket.ts`'s job is
-just to also fan `videoChunk`/`audioChunk` out to any connected `/native`
-clients, and fan `touchEvent`/`micChunk` from `/native` clients back into
-the same broadcast the socket.io side already does. Sketch:
-
-```ts
-// Socket.ts, sketch - not implemented
-const nativeClients = new Set<WebSocket>()
-
-wss.on('connection', (ws) => {
-  nativeClients.add(ws)
-  ws.on('close', () => nativeClients.delete(ws))
-  ws.on('message', (data: Buffer) => {
-    const tag = data.readUInt8(0)
-    if (tag === 0x03) socket_broadcastToOwner(MessageNames.MicChunk, data.subarray(1))
-    if (tag === 0x04) socket_broadcastToOwner(MessageNames.TouchEvent, parseTouch(data))
-  })
-})
-
-// wherever videoChunk/audioChunk are already broadcast to socket.io peers,
-// also write a tagged frame to every socket in nativeClients.
-```
+[socketMessages.ts](src/shared/socketMessages.ts). **Implemented** in
+[Socket.ts](src/main/Socket.ts): it fans `videoChunk`/`audioChunk` out to
+any connected `/native` clients as tagged frames, and fans
+`touchEvent`/`micChunk` from `/native` clients back into the same
+broadcast the socket.io side already uses (`handleNativeMessage`/
+`broadcastToNative`). No new dependency - `ws` is already present
+transitively via socket.io/engine.io; see `src/main/ws.d.ts` for the
+minimal ambient types (`@types/ws` isn't installed).
 
 ## GStreamer pipeline sketch (i.MX6 side)
 
