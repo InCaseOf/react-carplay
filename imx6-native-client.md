@@ -1,6 +1,13 @@
 # Native i.MX6 client (design sketch - NOT YET BUILT)
 
-Status: **design only**. Nothing in this document is implemented. See
+Status: **design only, ready to start building**. User has confirmed this
+is still the goal (bidirectional video/audio/touch, per remote-carplay.md's
+architecture, just with a hardware-decoding native client instead of a
+browser) and will **remove the Safelink ladder-logic program from the
+i.MX6** before implementation starts, so the new client has sole ownership
+of `imxv4l2sink`/the touchscreen/the sound card - no more coexistence
+concerns with whatever Safelink's video object was doing internally.
+Nothing in this document is implemented yet. See
 [remote-carplay.md](remote-carplay.md) for what *is* shipped (the
 browser-based remote viewer, which this is a second, alternative client
 for). Read that doc first - this one assumes its relay architecture.
