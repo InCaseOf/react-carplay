@@ -95,28 +95,38 @@ wss.on('connection', (ws) => {
 
 ## GStreamer pipeline sketch (i.MX6 side)
 
-**This is the part that most needs verification against your actual image**
-- exact element names differ between NXP's official Yocto BSP
-  (`gstreamer1.0-plugins-imx`: `imxvpudec`, `imxg2dvideosink`/`imxeglvivsink`,
-  etc.) and the older community `gstreamer-imx` project
-  (`imxvpudec_h264`, `imxg2dsink`, ...), and depend on your display stack
-  (X11 / Wayland / direct KMS / framebuffer).
+**Confirmed live via SSH on the actual board (2026-09-21)** - this is the
+official NXP `gstreamer1.0-plugins-imx` naming (generic `vpudec`, not the
+codec-specific `imxvpudec_h264` from the older community `gstreamer-imx`
+project). Actually-installed elements relevant here:
 
-**Fastest path to a correct answer: don't guess from scratch.** Take the
-exact `gst-launch-1.0` command line currently used for the RTSP pipeline,
-keep everything from the decoder element onward exactly as-is (it's already
-proven to work on this board/image), and only replace the front
-(`rtspsrc ! rtph264depay ! ...`) with an `appsrc` fed by the new WebSocket
-client. When we pick this back up, paste that existing command in and we
-can write the real pipeline instead of guessing element names.
+- Decoder: **`vpudec`** ("IMX VPU-based video decoder" - generic, negotiates
+  codec from caps, so `video/x-h264` input just works).
+- Encoders also present (`vpuenc_h264` etc.) - not needed for this direction
+  but confirms the same VPU plugin family throughout.
+- Sinks/converters available: `waylandsink`, `overlaysink` ("IMX Video
+  (video compositor) Sink"), `imxv4l2sink`, `v4l2sink`,
+  `imxcompositor_g2d`/`imxcompositor_ipu`, `imxvideoconvert_g2d`/`_ipu`.
+  `waylandsink` being present means this image is very likely running a
+  Wayland compositor (e.g. Weston) for display, not X11/plain framebuffer.
+- **Not yet found: the actual currently-running RTSP pipeline/command.**
+  Searched `/etc/systemd`, `/etc/xdg`, `/etc/init.d`, `/home`, and all
+  `*.sh` files on the box for `gst-launch` - no matches, and no `gst`
+  process was running at the time we checked. It's likely invoked from
+  somewhere we didn't search (a compiled binary calling
+  `gst_parse_launch()` directly, a script under a path we missed, or it
+  simply wasn't running because nothing was casting to it right then). If
+  you have the actual command/script, paste it in - still the fastest way
+  to know the exact sink element and any caps/queue tuning already proven
+  to work, rather than picking from the list above.
 
-Illustrative sketch (element names to be confirmed):
+Sketch, using the confirmed `vpudec` and (tentatively) `waylandsink`:
 
 ```
 appsrc name=videosrc format=time is-live=true do-timestamp=true caps="video/x-h264,stream-format=byte-stream,alignment=nal"
   ! h264parse
-  ! imxvpudec                 # or imxvpudec_h264 / vpudec - confirm via `gst-inspect-1.0 | grep -i vpu`
-  ! imxg2dvideosink           # or imxeglvivsink / waylandsink / kmssink - whatever the current RTSP pipeline's tail already uses
+  ! vpudec
+  ! waylandsink               # or overlaysink/imxv4l2sink - confirm against whatever the current RTSP pipeline's tail actually uses
 ```
 
 Built and driven programmatically (not `gst-launch` text), so the app can
@@ -130,19 +140,21 @@ gst_app_src_push_buffer(GST_APP_SRC(videosrc), buf);
 
 Audio playback (CarPlay → i.MX6 speaker), one `appsrc` per active
 `decodeType`/`audioType` pair (mirrors `PcmPlayer` in the browser client) -
-in practice usually just one or two at a time:
+in practice usually just one or two at a time. **Confirmed:** single sound
+card `sysdefault:CARD=imx6audiosgtl50` (imx6-audio-sgtl5000) handles both
+directions:
 
 ```
 appsrc name=audiosrc format=time is-live=true do-timestamp=true
   caps="audio/x-raw,format=S16LE,rate=<freq>,channels=<channels>,layout=interleaved"
-  ! audioconvert ! audioresample ! alsasink device=<confirm output device>
+  ! audioconvert ! audioresample ! alsasink device=sysdefault:CARD=imx6audiosgtl50
 ```
 
 Microphone capture (i.MX6 mic → SBC → dongle), resampled to the fixed
-16kHz mono `SendAudio` expects:
+16kHz mono `SendAudio` expects - same card, capture side:
 
 ```
-alsasrc device=<confirm mic device>
+alsasrc device=sysdefault:CARD=imx6audiosgtl50
   ! audioconvert ! audioresample
   ! capsfilter caps="audio/x-raw,format=S16LE,rate=16000,channels=1"
   ! appsink name=micsink emit-signals=true
@@ -151,11 +163,19 @@ Each buffer pulled from `micsink` becomes one tag-0x03 WebSocket frame.
 
 ## Touch input (i.MX6 side)
 
-The dongle protocol (`SendTouch`) only carries a single active point, so
-this doesn't need real multitouch handling - track one active touch:
+**Confirmed:** `EETI eGalax Touch Screen #0`, handlers `mouse0 event0` - so
+the device node is `/dev/input/event0`. `EV=b` (SYN + KEY + ABS bits only,
+no `EV_MSC`) - consistent with a classic single-touch eGalax device
+(`BTN_TOUCH` + `ABS_X`/`ABS_Y`), not a type-B multitouch protocol, though
+worth a quick `evtest /dev/input/event0` to see the actual `ABS_MT_*`
+capability bits before assuming, since eGalax also makes multitouch
+controllers.
 
-- Open the touchscreen's `/dev/input/eventN` directly (identify the right
-  node with `evtest` or `libinput list-devices`).
+The dongle protocol (`SendTouch`) only carries a single active point
+anyway, so this doesn't need real multitouch handling regardless - track
+one active touch:
+
+- Open `/dev/input/event0` directly.
 - Read `struct input_event` records (`EV_ABS` for `ABS_X`/`ABS_Y`, `EV_KEY`
   for `BTN_TOUCH`, `EV_SYN`/`SYN_REPORT` to flush a batch).
 - Normalise using the axis min/max from `EVIOCGABS` (`ioctl`), not assumed
@@ -179,19 +199,35 @@ much smaller change than anything above: `Carplay.tsx` would skip creating
 carries on unchanged either way. Worth doing once the i.MX6 client above is
 working and proven, not before.
 
-## Open questions before writing real code
+## Open questions - status after live SSH recon (2026-09-21)
 
-1. **Your current working `gst-launch-1.0` RTSP command** - paste it in so
-   the decoder/sink tail can be reused verbatim instead of guessed.
-2. **`gst-inspect-1.0 | grep -i vpu` / `grep -i g2d` / `grep -i imx`** output,
-   to confirm exact element names if the current command doesn't already
-   make them obvious.
-3. **Touchscreen device node** - `/dev/input/eventN` for the panel, and
-   whether it's single-touch or a type-B multitouch protocol.
-4. **Mic and speaker ALSA device names** (`aplay -L` / `arecord -L`).
-5. **Toolchain** - is there a C/C++ compiler and GStreamer dev headers
-   *on* the i.MX6 image itself, or does this need cross-compiling from a
-   dev machine/Yocto SDK? Changes how this gets built and iterated on.
-6. Confirm: once this is proven, do you want to actually remove
-   ffmpeg/MediaMTX from the Pi/i.MX6 setup, or leave them installed-but-idle
-   as a fallback?
+1. ~~Your current working `gst-launch-1.0` RTSP command~~ - **still
+   unresolved**. Not found on disk/in running processes (see GStreamer
+   section above) - needs you to point at it directly, or confirm it's
+   invoked in a way a filesystem search wouldn't catch (compiled binary,
+   remote-triggered, etc).
+2. ~~`gst-inspect-1.0` output~~ - **done**, see above: `vpudec`,
+   `waylandsink`/`overlaysink`/`imxv4l2sink`, `imxcompositor_g2d/_ipu`.
+3. ~~Touchscreen device node~~ - **done**: `/dev/input/event0`, EETI
+   eGalax, looks single-touch (worth a quick `evtest` sanity check).
+4. ~~Mic/speaker ALSA device names~~ - **done**: `sysdefault:CARD=imx6audiosgtl50`
+   for both.
+5. **Toolchain - confirmed missing on-device.** `gcc` not found on the
+   board (`command not found`); `gst-launch-1.0` itself is present at
+   `/usr/bin/gst-launch-1.0`. This means the C/C++ client will need to be
+   **cross-compiled** from a dev machine (NXP Yocto SDK / toolchain
+   matching this board's BSP version) rather than built in place - worth
+   confirming what SDK/toolchain is available to you before writing code,
+   since that dictates the build setup as much as the pipeline itself.
+6. **Still open**: once this is proven, remove ffmpeg/MediaMTX entirely,
+   or leave them installed-but-idle as a fallback?
+
+Also noted this session, for the Pi side (not blocking, just useful
+context for later): the deployed app there is a built AppImage
+(`/home/pi/Desktop/Carplay.AppImage`, autostarted via
+`/etc/xdg/autostart/carplay.desktop`), not run from a source checkout via
+`npm`/`electron-vite dev` - `node`/`npm` aren't even on the Pi's `PATH`.
+There are a few source-looking directories on the Pi worth sorting out
+which (if any) is the real checkout before touching anything there:
+`/home/pi/r2q/carplay`, `/home/pi/react-carplay_org`, config at
+`/home/pi/.config/react-carplay`.
