@@ -1,13 +1,25 @@
 import { ExtraConfig } from "./Globals";
 import { Server } from 'socket.io'
+import { WebSocketServer, WebSocket } from 'ws'
 import { EventEmitter } from 'events'
 import { Stream } from "socketmost/dist/modules/Messages";
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { readFile } from 'fs'
 import { extname, join, normalize } from 'path'
-import { MessageNames } from "../shared/socketMessages";
+import { MessageNames, RemoteAudioChunk, RemoteTouchEvent } from "../shared/socketMessages";
 
 export { MessageNames }
+
+// Raw WebSocket endpoint for the native i.MX6 client (no socket.io/engine.io
+// framing, no JSON) - see imx6-native-client.md. Every frame is tagged with
+// a 1-byte type as its first byte.
+const NATIVE_WS_PATH = '/native'
+const NativeTag = {
+  VideoChunk: 0x01,
+  AudioChunk: 0x02,
+  MicChunk: 0x03,
+  TouchEvent: 0x04
+} as const
 
 // Static assets for the remote viewer page (built alongside the main
 // renderer, see electron.vite.config.ts). Served from the same port as the
@@ -31,6 +43,8 @@ export class Socket extends EventEmitter {
   config: ExtraConfig
   io: Server
   saveSettings: (settings: ExtraConfig) => void
+  // Native i.MX6 clients connected to /native - see broadcastToNative.
+  private nativeClients = new Set<WebSocket>()
   constructor(config: ExtraConfig, saveSettings: (settings: ExtraConfig) => void) {
     super()
     this.config = config
@@ -46,6 +60,20 @@ export class Socket extends EventEmitter {
       cors: {
         origin: '*'
       }
+    })
+
+    // Same coexistence pattern as the http 'request' listener above:
+    // engine.io already registered its own 'upgrade' listener for
+    // /socket.io/ paths, so this one only acts on /native and otherwise
+    // leaves the socket alone for that other listener to handle.
+    const nativeWss = new WebSocketServer({ noServer: true })
+    httpServer.on('upgrade', (req, socket, head) => {
+      if (req.url !== NATIVE_WS_PATH) return
+      nativeWss.handleUpgrade(req, socket, head, (ws) => {
+        this.nativeClients.add(ws)
+        ws.on('close', () => this.nativeClients.delete(ws))
+        ws.on('message', (data: Buffer) => this.handleNativeMessage(data))
+      })
     })
 
     this.io.on(MessageNames.Connection, (socket) => {
@@ -70,10 +98,15 @@ export class Socket extends EventEmitter {
       // works whether there's one remote viewer or several.
       socket.on(MessageNames.VideoChunk, (chunk: ArrayBuffer) => {
         socket.broadcast.emit(MessageNames.VideoChunk, chunk)
+        this.broadcastToNative(NativeTag.VideoChunk, Buffer.from(chunk))
       })
 
-      socket.on(MessageNames.AudioChunk, (chunk: unknown) => {
+      socket.on(MessageNames.AudioChunk, (chunk: RemoteAudioChunk) => {
         socket.broadcast.emit(MessageNames.AudioChunk, chunk)
+        const header = Buffer.alloc(4)
+        header.writeUInt16LE(chunk.decodeType, 0)
+        header.writeUInt16LE(chunk.audioType, 2)
+        this.broadcastToNative(NativeTag.AudioChunk, Buffer.concat([header, Buffer.from(chunk.data)]))
       })
 
       socket.on(MessageNames.TouchEvent, (touch: unknown) => {
@@ -122,6 +155,34 @@ export class Socket extends EventEmitter {
         'Cross-Origin-Embedder-Policy': 'require-corp'
       })
       res.end(data)
+    })
+  }
+
+  // A tagged frame arriving from a native i.MX6 client: either its mic
+  // uplink or a touch event. Both get fed into the same broadcast the
+  // socket.io side already uses, so CarPlay.worker.ts (the socket that
+  // actually owns the dongle) handles them identically regardless of
+  // whether they came from a browser remote viewer or a native client.
+  private handleNativeMessage(data: Buffer) {
+    const tag = data.readUInt8(0)
+    if (tag === NativeTag.MicChunk) {
+      this.io.emit(MessageNames.MicChunk, new Uint8Array(data.subarray(1)).buffer)
+    } else if (tag === NativeTag.TouchEvent) {
+      const touch: RemoteTouchEvent = {
+        action: data.readUInt8(1),
+        x: data.readFloatLE(2),
+        y: data.readFloatLE(6)
+      }
+      this.io.emit(MessageNames.TouchEvent, touch)
+    }
+  }
+
+  private broadcastToNative(tag: number, payload: Buffer) {
+    if (this.nativeClients.size === 0) return
+    const frame = Buffer.concat([Buffer.from([tag]), payload])
+    this.nativeClients.forEach((client) => {
+      // 1 === WebSocket.OPEN
+      if (client.readyState === 1) client.send(frame)
     })
   }
 
