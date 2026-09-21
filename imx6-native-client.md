@@ -109,24 +109,39 @@ project). Actually-installed elements relevant here:
   `imxcompositor_g2d`/`imxcompositor_ipu`, `imxvideoconvert_g2d`/`_ipu`.
   `waylandsink` being present means this image is very likely running a
   Wayland compositor (e.g. Weston) for display, not X11/plain framebuffer.
-- **Not yet found: the actual currently-running RTSP pipeline/command.**
-  Searched `/etc/systemd`, `/etc/xdg`, `/etc/init.d`, `/home`, and all
-  `*.sh` files on the box for `gst-launch` - no matches, and no `gst`
-  process was running at the time we checked. It's likely invoked from
-  somewhere we didn't search (a compiled binary calling
-  `gst_parse_launch()` directly, a script under a path we missed, or it
-  simply wasn't running because nothing was casting to it right then). If
-  you have the actual command/script, paste it in - still the fastest way
-  to know the exact sink element and any caps/queue tuning already proven
-  to work, rather than picking from the list above.
+- **Confirmed - the actual working RTSP test commands (from the user, not
+  found by our filesystem search - it wasn't running as a persistent
+  service, just invoked ad hoc for testing):**
+  ```bash
+  gst-launch-1.0 rtspsrc location=rtsp://192.168.155.5:8554/live latency=50 ! decodebin ! imxv4l2sink
+  # or, to help latency:
+  gst-launch-1.0 rtspsrc location=rtsp://192.168.155.5:8554/live latency=50 ! decodebin ! imxv4l2sink sync=false
+  # or, positioned in a specific screen region:
+  gst-launch-1.0 rtspsrc location=rtsp://192.168.155.5:8554/live latency=50 ! decodebin ! imxv4l2sink sync=false \
+    overlay-left=241 overlay-top=161 overlay-width=640 overlay-height=480 device=/dev/video17
+  ```
+  So the real sink is **`imxv4l2sink`**, not `waylandsink`/`overlaysink` as
+  guessed below originally. `decodebin` autoplugs down to `vpudec` (the
+  only installed H.264 decoder), confirming `vpudec` is right to call
+  explicitly in the new client instead of using `decodebin`'s generic
+  autoplugging - explicit is simpler to drive from C. `sync=false` matters
+  for us too: our frames are arriving live off a WebSocket with no
+  meaningful clock reference, same reason it's used here for the RTSP
+  case. `latency=50` is an `rtspsrc`-only jitter-buffer property - not
+  applicable once `rtspsrc` is replaced by `appsrc`.
+  **Not yet confirmed: which of the three (plain / `sync=false` / the
+  positioned `overlay-*` + `device=/dev/video17` variant) is what actually
+  runs in normal operation** vs. which were just test variants - matters
+  for whether the new client should hardcode those specific overlay
+  coordinates/device or just use sink defaults (likely fullscreen).
 
-Sketch, using the confirmed `vpudec` and (tentatively) `waylandsink`:
+Real pipeline, adapted for our `appsrc` source instead of `rtspsrc`:
 
 ```
 appsrc name=videosrc format=time is-live=true do-timestamp=true caps="video/x-h264,stream-format=byte-stream,alignment=nal"
   ! h264parse
   ! vpudec
-  ! waylandsink               # or overlaysink/imxv4l2sink - confirm against whatever the current RTSP pipeline's tail actually uses
+  ! imxv4l2sink sync=false   # add overlay-left/top/width/height + device=/dev/video17 if that positioned variant turns out to be the real one
 ```
 
 Built and driven programmatically (not `gst-launch` text), so the app can
@@ -201,11 +216,10 @@ working and proven, not before.
 
 ## Open questions - status after live SSH recon (2026-09-21)
 
-1. ~~Your current working `gst-launch-1.0` RTSP command~~ - **still
-   unresolved**. Not found on disk/in running processes (see GStreamer
-   section above) - needs you to point at it directly, or confirm it's
-   invoked in a way a filesystem search wouldn't catch (compiled binary,
-   remote-triggered, etc).
+1. ~~Your current working `gst-launch-1.0` RTSP command~~ - **done**, see
+   above: `rtspsrc ! decodebin ! imxv4l2sink`, three variants. Still open:
+   which variant (plain / `sync=false` / positioned `overlay-*` +
+   `device=/dev/video17`) is the real one in normal use.
 2. ~~`gst-inspect-1.0` output~~ - **done**, see above: `vpudec`,
    `waylandsink`/`overlaysink`/`imxv4l2sink`, `imxcompositor_g2d/_ipu`.
 3. ~~Touchscreen device node~~ - **done**: `/dev/input/event0`, EETI
