@@ -49,16 +49,19 @@ statically linked.
   API-version differences (this targets the modern `lws_client_connect_via_info`
   API; older SDKs may ship an older libwebsockets with a different
   connect API).
-- **Never run against the board.** In particular:
-  - Which of the three `gst-launch` variants in the design doc
-    (plain / `sync=false` / positioned `overlay-*` + `device=/dev/video17`)
-    is the real production configuration is still unconfirmed - this client
-    currently hardcodes the middle one (`sync=false`, sink defaults/fullscreen).
-  - Whether the touchscreen is truly single-touch (vs. type-B multitouch)
-    was never checked with `evtest` - `src/touch.c` assumes single-touch.
-- **No reconnect backoff tuning** - it retries every `RECONNECT_DELAY_MS`
-  (2s) forever; fine for a first test, probably wants jitter/backoff for
-  production.
+- **Never run against the board.** Confirmed: the `sync=false` /
+  `imxv4l2sink` pipeline this client hardcodes is the correct one (shows
+  video on the physical screen), and the screen is a real touchscreen -
+  no further verification needed there before a first real run.
+- **No reconnect jitter** - it retries every `RECONNECT_DELAY_MS` (2s)
+  forever with no jitter; fine for a first test, probably wants jitter for
+  production so a whole fleet doesn't hammer the SBC in lockstep after a
+  restart. (A prior draft of this file also had no delay at all on the
+  "connection drops after being established" path - fixed by tracking
+  `next_connect_attempt_ms` in `AppContext` and checking it from both the
+  synchronous connect-failure path and the async
+  `LWS_CALLBACK_CLIENT_CONNECTION_ERROR`/`LWS_CALLBACK_CLIENT_CLOSED`
+  callbacks in `src/main.c`.)
 - **Audio player eviction is naive** - if more than `MAX_AUDIO_PLAYERS` (4)
   concurrent audio streams show up, it evicts slot 0 rather than the
   actual least-recently-used one. Unlikely to matter in practice (CarPlay

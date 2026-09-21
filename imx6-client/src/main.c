@@ -14,8 +14,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "touch.h"
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* ---- wire protocol, from imx6-native-client.md ---- */
 #define TAG_VIDEO_CHUNK 0x01 /* SBC -> us: raw H.264 Annex-B, one frame */
@@ -78,6 +85,12 @@ typedef struct {
     struct lws *wsi;
     struct lws_context *lws_ctx;
     volatile int connected;
+    /* Earliest time (now_ms()) main()'s loop should attempt the next
+     * lws_client_connect_via_info() call. Set both when that call itself
+     * fails synchronously and, from ws_callback, when an established
+     * connection later drops asynchronously - otherwise the loop reconnects
+     * on the very next iteration with no delay at all in the latter case. */
+    int64_t next_connect_attempt_ms;
 
     /* Outgoing queue: touch events (touch thread) and mic audio (GStreamer's
      * own streaming thread) both enqueue here; only the lws service thread
@@ -277,12 +290,18 @@ static void on_audio_chunk(AppContext *ctx, const uint8_t *data, size_t len) {
     gst_app_src_push_buffer(GST_APP_SRC(player->appsrc), buf);
 }
 
-static void rx_buf_ensure(AppContext *ctx, size_t needed) {
-    if (ctx->rx_cap >= needed) return;
+/* Returns 0 on success, -1 on allocation failure (ctx->rx_buf/rx_cap are
+ * left unchanged so the caller can bail out instead of writing past a
+ * too-small or NULL buffer). */
+static int rx_buf_ensure(AppContext *ctx, size_t needed) {
+    if (ctx->rx_cap >= needed) return 0;
     size_t new_cap = ctx->rx_cap ? ctx->rx_cap * 2 : 65536;
     while (new_cap < needed) new_cap *= 2;
-    ctx->rx_buf = realloc(ctx->rx_buf, new_cap);
+    unsigned char *grown = realloc(ctx->rx_buf, new_cap);
+    if (!grown) return -1;
+    ctx->rx_buf = grown;
     ctx->rx_cap = new_cap;
+    return 0;
 }
 
 static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user,
@@ -304,7 +323,12 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *
             break;
 
         case LWS_CALLBACK_CLIENT_RECEIVE:
-            rx_buf_ensure(ctx, ctx->rx_len + len);
+            if (rx_buf_ensure(ctx, ctx->rx_len + len) != 0) {
+                fprintf(stderr, "ws: rx_buf_ensure(%zu) failed, dropping message\n",
+                        ctx->rx_len + len);
+                ctx->rx_len = 0;
+                break;
+            }
             memcpy(ctx->rx_buf + ctx->rx_len, in, len);
             ctx->rx_len += len;
             if (lws_is_final_fragment(wsi)) {
@@ -348,12 +372,14 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *
             fprintf(stderr, "ws: connection error: %s\n", in ? (char *)in : "?");
             ctx->connected = 0;
             ctx->wsi = NULL;
+            ctx->next_connect_attempt_ms = now_ms() + RECONNECT_DELAY_MS;
             break;
 
         case LWS_CALLBACK_CLIENT_CLOSED:
             fprintf(stderr, "ws: closed\n");
             ctx->connected = 0;
             ctx->wsi = NULL;
+            ctx->next_connect_attempt_ms = now_ms() + RECONNECT_DELAY_MS;
             break;
 
         default:
@@ -397,6 +423,10 @@ int main(int argc, char **argv) {
 
     for (;;) {
         if (!g_ctx.connected && !g_ctx.wsi) {
+            if (now_ms() < g_ctx.next_connect_attempt_ms) {
+                lws_service(g_ctx.lws_ctx, 50);
+                continue;
+            }
             struct lws_client_connect_info ccinfo;
             memset(&ccinfo, 0, sizeof(ccinfo));
             ccinfo.context = g_ctx.lws_ctx;
@@ -409,6 +439,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ws: connecting to ws://%s:%d%s\n", host, port, WS_PATH);
             g_ctx.wsi = lws_client_connect_via_info(&ccinfo);
             if (!g_ctx.wsi) {
+                g_ctx.next_connect_attempt_ms = now_ms() + RECONNECT_DELAY_MS;
                 lws_service(g_ctx.lws_ctx, RECONNECT_DELAY_MS);
                 continue;
             }
